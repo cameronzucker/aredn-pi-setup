@@ -143,12 +143,20 @@ _wifi_scan_channels() {
     local band_ghz="$1"
     SCAN_RECOMMENDED_CHANNEL=""
 
-    # NetworkManager owns wlan0 — use nmcli rather than iw to avoid scan failures
-    gum spin --spinner dot --title "Scanning nearby networks…" -- \
-        nmcli device wifi rescan ifname wlan0 2>/dev/null || true
+    # WiFi radio may be disabled if no profile is active — enable it temporarily
+    if [[ "$(nmcli radio wifi 2>/dev/null)" != "enabled" ]]; then
+        say "  Enabling WiFi radio for scan..."
+        nmcli radio wifi on 2>/dev/null || true
+    fi
 
-    local scan_data
-    scan_data=$(nmcli -t -f CHAN,SIGNAL device wifi list ifname wlan0 2>/dev/null)
+    # --rescan yes forces a fresh scan inline; --wait 30 gives time for 5 GHz DFS channels.
+    # Results written to a temp file so gum spin (which runs the command) renders correctly.
+    # Drop ifname filter on list — some NM versions don't support it there.
+    local scan_tmp; scan_tmp=$(mktemp)
+    gum spin --spinner dot --title "Scanning nearby networks…" -- \
+        sh -c "nmcli --wait 30 -t -f CHAN,SIGNAL device wifi list --rescan yes \
+               > '$scan_tmp' 2>/dev/null || true"
+    local scan_data; scan_data=$(cat "$scan_tmp"); rm -f "$scan_tmp"
 
     # Build per-channel AP count and best signal (nmcli signal: 0–100 quality score)
     declare -A ch_count ch_signal
@@ -180,6 +188,13 @@ _wifi_scan_channels() {
     for ch in "${!ch_count[@]}"; do
         (( ch_count[$ch] > max_count )) && max_count=${ch_count[$ch]}
     done
+
+    if (( total == 0 )); then
+        warn "No ${band_ghz} GHz networks found (radio state: $(nmcli radio wifi 2>/dev/null || echo unknown))"
+        warn "If you just enabled the radio, try the Scan option again."
+        SCAN_RECOMMENDED_CHANNEL=""
+        return 0
+    fi
 
     local recommended="" min_seen=99999 table="" n sig
 
