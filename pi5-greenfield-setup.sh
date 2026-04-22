@@ -4,24 +4,25 @@
 # Post-imaging setup for Raspberry Pi 5 on Raspberry Pi OS Trixie (Desktop, arm64)
 #
 # What this does (roughly in order):
-#   1. Prompts for hotspot credentials up front so the rest can run unattended
-#   2. Updates apt & installs prerequisites
-#   3. Enables VNC, I2C, UART via raspi-config (non-interactive)
-#   4. Writes usb_max_current_enable=1 and dtparam=pciex1_gen=3 to config.txt
-#   5. Disables fake-hwclock (Pi 5 has a native RTC powered by CR2032 on the HAT)
-#   6. Warns about RTC battery charging settings
-#   7. Installs base quality-of-life packages (tmux, git, gh, jq, rg, etc.)
-#   8. Configures UFW firewall (early — limits unprotected exposure window)
-#   9. Installs gpsd, chrony, btop, kdiskmark, nvme-cli
-#  10. Installs CAD tools: KiCad, FreeCAD, OpenSCAD, Inkscape
-#  11. Installs VS Code from Microsoft's apt repo
-#  12. Installs VS Code extensions: Claude Code (anthropic.claude-code),
+#   1. Bootstraps gum (Charm.sh) for interactive UI
+#   2. Prompts for hotspot credentials up front so the rest can run unattended
+#   3. Updates apt & installs prerequisites
+#   4. Enables VNC, I2C, UART via raspi-config (non-interactive)
+#   5. Writes usb_max_current_enable=1 and dtparam=pciex1_gen=3 to config.txt
+#   6. Disables fake-hwclock (Pi 5 has a native RTC powered by CR2032 on the HAT)
+#   7. Warns about RTC battery charging settings
+#   8. Installs base quality-of-life packages (tmux, git, gh, jq, rg, etc.)
+#   9. Configures UFW firewall (early — limits unprotected exposure window)
+#  10. Installs gpsd, chrony, btop, kdiskmark, nvme-cli
+#  11. Installs CAD tools: KiCad, FreeCAD, OpenSCAD, Inkscape
+#  12. Installs VS Code from Microsoft's apt repo
+#  13. Installs VS Code extensions: Claude Code (anthropic.claude-code),
 #       Codex (openai.chatgpt)
-#  13. Installs Node.js and the Claude Code + Codex CLIs via npm
-#  14. Installs Tailscale
-#  15. Creates a WiFi hotspot (eth0 WAN -> wlan0 AP) via NetworkManager
-#  16. Sets dark mode preference via GTK settings
-#  17. Offers to run `tailscale up` and reboot at the end
+#  14. Installs Node.js and the Claude Code + Codex CLIs via npm
+#  15. Installs Tailscale
+#  16. Creates a WiFi hotspot (eth0 WAN -> wlan0 AP) via NetworkManager
+#  17. Sets dark mode preference via GTK settings
+#  18. Offers to run `tailscale up` and reboot at the end
 #
 # Run with: sudo ./pi5-greenfield-setup.sh
 # Re-running is safe — most steps are idempotent.
@@ -29,36 +30,29 @@
 set -o pipefail
 
 # ============================================================================
-# Output helpers
+# Output helpers — defined here, require gum (bootstrapped below)
 # ============================================================================
-RED=$'\033[0;31m'
-GREEN=$'\033[0;32m'
-YELLOW=$'\033[0;33m'
-BLUE=$'\033[0;34m'
-BOLD=$'\033[1m'
-RESET=$'\033[0m'
-
-say()  { printf '%s==>%s %s\n' "$BLUE" "$RESET" "$*"; }
-ok()   { printf '%s[ok]%s %s\n' "$GREEN" "$RESET" "$*"; }
-warn() { printf '%s[warn]%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
-err()  { printf '%s[err]%s %s\n' "$RED" "$RESET" "$*" >&2; }
-hr()   { printf '%s%s%s\n' "$BOLD" "------------------------------------------------------------" "$RESET"; }
+say()  { gum style --foreground 4 "==> $*"; }
+ok()   { gum style --foreground 2 " ✓  $*"; }
+warn() { gum style --foreground 3 " ⚠  $*" >&2; }
+err()  { gum style --foreground 1 " ✗  $*" >&2; }
+hr()   { gum style --foreground 8 "────────────────────────────────────────────────────────────"; }
 
 # Track failures so we can summarize at the end rather than halt on first hiccup.
 FAILURES=()
 record_fail() { FAILURES+=("$1"); }
 
 # ============================================================================
-# Pre-flight checks
+# Pre-flight checks (plain printf — gum not yet available)
 # ============================================================================
 if [[ $EUID -ne 0 ]]; then
-    err "This script must be run with sudo."
+    printf '[err] This script must be run with sudo.\n' >&2
     exit 1
 fi
 
 if [[ -z "${SUDO_USER:-}" || "$SUDO_USER" == "root" ]]; then
-    err "Run this with 'sudo ./pi5-greenfield-setup.sh' as a normal user,"
-    err "not directly as root — we need to configure user-level settings."
+    printf '[err] Run with '"'"'sudo ./pi5-greenfield-setup.sh'"'"' as a normal user,\n' >&2
+    printf '[err] not directly as root — we need to configure user-level settings.\n' >&2
     exit 1
 fi
 
@@ -66,73 +60,108 @@ USER_NAME="$SUDO_USER"
 USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)
 
 if [[ ! -d "$USER_HOME" ]]; then
-    err "Couldn't determine home directory for user $USER_NAME"
+    printf '[err] Could not determine home directory for user %s\n' "$USER_NAME" >&2
     exit 1
 fi
 
 # Run a command as the target user, preserving their environment
 as_user() { sudo -u "$USER_NAME" -H "$@"; }
 
-# Check we're on a Pi 5
+# ============================================================================
+# Bootstrap gum (Charm.sh) — required for all interactive UI below
+# ============================================================================
+_bootstrap_gum() {
+    command -v gum >/dev/null 2>&1 && return 0
+    printf 'Installing gum (required for interactive UI)...\n'
+    # Try system apt cache first — gum is in Debian Trixie/Sid repos
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gum \
+            >/dev/null 2>&1; then
+        return 0
+    fi
+    # Fallback: Charm's official apt repo
+    printf 'Not found in apt — adding Charm repo...\n'
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://repo.charm.sh/apt/gpg.key \
+        | gpg --dearmor -o /etc/apt/keyrings/charm.gpg \
+        || { printf '[err] Could not fetch Charm repo key\n' >&2; exit 1; }
+    printf 'deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *\n' \
+        > /etc/apt/sources.list.d/charm.list
+    apt-get update -qq >/dev/null 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get install -y gum \
+        || { printf '[err] Could not install gum\n' >&2; exit 1; }
+}
+_bootstrap_gum
+
+# ============================================================================
+# Pi / OS checks (gum now available)
+# ============================================================================
 if ! grep -q "Raspberry Pi 5" /proc/cpuinfo 2>/dev/null \
    && ! grep -q "Raspberry Pi 5" /proc/device-tree/model 2>/dev/null; then
     warn "This doesn't look like a Raspberry Pi 5."
-    read -r -p "Continue anyway? [y/N]: " resp
-    [[ "$resp" =~ ^[Yy]$ ]] || exit 1
+    gum confirm "Continue anyway?" || exit 1
 fi
 
-# Check we're on Trixie
 if ! grep -q "trixie" /etc/os-release 2>/dev/null; then
     warn "This doesn't appear to be Debian Trixie."
-    read -r -p "Continue anyway? [y/N]: " resp
-    [[ "$resp" =~ ^[Yy]$ ]] || exit 1
+    gum confirm "Continue anyway?" || exit 1
 fi
 
 # ============================================================================
 # Collect interactive input up front
 # ============================================================================
 hr
-printf '%s=== Pi 5 Greenfield Setup ===%s\n\n' "$BOLD" "$RESET"
-echo "Collecting config up front so the rest can run unattended."
-echo "Target user: $USER_NAME (home: $USER_HOME)"
-echo
+gum style --bold --foreground 4 "  Pi 5 Greenfield Setup  "
+printf '\n'
+say "Collecting config up front so the rest can run unattended."
+say "Target user: $USER_NAME  (home: $USER_HOME)"
+printf '\n'
 
-read -r -p "Hotspot SSID [PiField]: " HOTSPOT_SSID
-HOTSPOT_SSID=${HOTSPOT_SSID:-PiField}
+HOTSPOT_SSID=$(gum input \
+    --header "Hotspot SSID" \
+    --placeholder "PiField" \
+    --value "PiField") \
+    || { printf 'Aborted.\n'; exit 0; }
 
-read -r -p "Hotspot channel (2.4GHz: 1-11) [6]: " HOTSPOT_CHANNEL
-HOTSPOT_CHANNEL=${HOTSPOT_CHANNEL:-6}
+HOTSPOT_CHANNEL=$(gum input \
+    --header "Hotspot channel (2.4 GHz, 1–11)" \
+    --placeholder "6" \
+    --value "6") \
+    || { printf 'Aborted.\n'; exit 0; }
+
 if ! [[ "$HOTSPOT_CHANNEL" =~ ^[0-9]+$ ]] || (( HOTSPOT_CHANNEL < 1 || HOTSPOT_CHANNEL > 11 )); then
-    err "Hotspot channel must be 1-11 (got: '$HOTSPOT_CHANNEL')"
+    err "Hotspot channel must be 1–11 (got: '$HOTSPOT_CHANNEL')"
     exit 1
 fi
 
 while true; do
-    read -r -s -p "Hotspot WPA2 passphrase (min 8 chars): " HOTSPOT_PSK
-    echo
+    HOTSPOT_PSK=$(gum input --password \
+        --header "Hotspot WPA2 passphrase (min 8 chars)") \
+        || { printf 'Aborted.\n'; exit 0; }
     if [[ ${#HOTSPOT_PSK} -lt 8 ]]; then
         warn "Passphrase must be at least 8 characters."
         continue
     fi
-    read -r -s -p "Confirm passphrase: " HOTSPOT_PSK2
-    echo
+    HOTSPOT_PSK2=$(gum input --password \
+        --header "Confirm passphrase") \
+        || { printf 'Aborted.\n'; exit 0; }
     if [[ "$HOTSPOT_PSK" != "$HOTSPOT_PSK2" ]]; then
-        warn "Passphrases don't match, try again."
+        warn "Passphrases don't match — try again."
         continue
     fi
     break
 done
 
-echo
-printf '%sConfiguration summary:%s\n' "$BOLD" "$RESET"
-echo "  User:            $USER_NAME"
-echo "  Hotspot SSID:    $HOTSPOT_SSID"
-echo "  Hotspot channel: $HOTSPOT_CHANNEL (2.4GHz)"
-echo "  Hotspot PSK:     [${#HOTSPOT_PSK} chars]"
-echo "  Hotspot subnet:  10.42.0.0/24 (NetworkManager default)"
-echo
-read -r -p "Proceed? [Y/n]: " resp
-[[ "$resp" =~ ^[Nn]$ ]] && { echo "Aborted."; exit 0; }
+printf '\n'
+gum style \
+    --border rounded \
+    --border-foreground 4 \
+    --padding "1 2" \
+    "$(printf 'User:    %s\nSSID:    %s\nChannel: %s (2.4 GHz)\nPSK:     [%d chars]\nSubnet:  10.42.0.0/24' \
+        "$USER_NAME" "$HOTSPOT_SSID" "$HOTSPOT_CHANNEL" "${#HOTSPOT_PSK}")"
+printf '\n'
+
+gum confirm "Proceed with setup?" || { printf 'Aborted.\n'; exit 0; }
+printf '\n'
 
 # ============================================================================
 # Step functions
@@ -141,10 +170,13 @@ read -r -p "Proceed? [Y/n]: " resp
 update_apt() {
     hr
     say "Updating apt and installing prerequisites..."
-    apt update || { record_fail "apt update"; return 1; }
-    DEBIAN_FRONTEND=noninteractive apt install -y \
-        lsb-release curl wget gpg apt-transport-https ca-certificates \
-        software-properties-common gnupg \
+    gum spin --spinner dot --title "Running apt update..." -- \
+        apt-get update \
+        || { record_fail "apt update"; return 1; }
+    gum spin --spinner dot --title "Installing prerequisites..." -- \
+        env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            lsb-release curl wget gpg apt-transport-https ca-certificates \
+            software-properties-common gnupg \
         || { record_fail "prereq packages"; return 1; }
     ok "apt ready"
 }
@@ -207,7 +239,7 @@ disable_fake_hwclock() {
     hr
     say "Disabling fake-hwclock (Pi 5 has a real hardware RTC)..."
     systemctl disable --now fake-hwclock.service 2>/dev/null || true
-    apt purge -y fake-hwclock 2>/dev/null || true
+    apt-get purge -y fake-hwclock 2>/dev/null || true
     ok "fake-hwclock removed"
 }
 
@@ -233,11 +265,12 @@ check_rtc_charging() {
 install_base_packages() {
     hr
     say "Installing base / quality-of-life packages..."
-    DEBIAN_FRONTEND=noninteractive apt install -y \
-        tmux git gh ufw jq ripgrep fd-find ncdu iotop nvme-cli \
-        htop btop \
-        build-essential \
-        libglib2.0-bin \
+    gum spin --spinner dot --title "Installing base packages..." -- \
+        env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            tmux git gh ufw jq ripgrep fd-find ncdu iotop nvme-cli \
+            htop btop \
+            build-essential \
+            libglib2.0-bin \
         || record_fail "base packages"
     ok "Base packages installed"
 }
@@ -245,8 +278,9 @@ install_base_packages() {
 install_time_gps() {
     hr
     say "Installing gpsd and chrony..."
-    DEBIAN_FRONTEND=noninteractive apt install -y \
-        gpsd gpsd-clients pps-tools chrony \
+    gum spin --spinner dot --title "Installing gpsd, gpsd-clients, pps-tools, chrony..." -- \
+        env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            gpsd gpsd-clients pps-tools chrony \
         || record_fail "gpsd/chrony"
     # Leave services as installed; user will configure them for their GPS setup
     ok "gpsd + chrony installed (manual configuration required for GPS NTP)"
@@ -255,7 +289,8 @@ install_time_gps() {
 install_kdiskmark() {
     hr
     say "Installing KDiskMark..."
-    DEBIAN_FRONTEND=noninteractive apt install -y kdiskmark \
+    gum spin --spinner dot --title "Installing kdiskmark..." -- \
+        env DEBIAN_FRONTEND=noninteractive apt-get install -y kdiskmark \
         || record_fail "kdiskmark"
     ok "kdiskmark done"
 }
@@ -263,12 +298,13 @@ install_kdiskmark() {
 install_cad_tools() {
     hr
     say "Installing CAD tools: KiCad, FreeCAD, OpenSCAD, Inkscape..."
-    say "  (KiCad + FreeCAD libraries are ~1GB combined; this takes a while)"
-    DEBIAN_FRONTEND=noninteractive apt install -y \
-        kicad kicad-libraries \
-        freecad \
-        openscad \
-        inkscape \
+    warn "KiCad + FreeCAD libraries are ~1 GB combined — this will take a while."
+    gum spin --spinner dot --title "Installing CAD tools (~1 GB — please wait)..." -- \
+        env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            kicad kicad-libraries \
+            freecad \
+            openscad \
+            inkscape \
         || record_fail "CAD tools"
     ok "CAD tools installed"
 }
@@ -282,9 +318,9 @@ install_vscode() {
     fi
 
     # Import Microsoft signing key
-    wget -qO- https://packages.microsoft.com/keys/microsoft.asc \
-        | gpg --dearmor \
-        > /usr/share/keyrings/packages.microsoft.gpg \
+    gum spin --spinner dot --title "Fetching Microsoft GPG key..." -- \
+        sh -c 'wget -qO- https://packages.microsoft.com/keys/microsoft.asc \
+            | gpg --dearmor > /usr/share/keyrings/packages.microsoft.gpg' \
         || { record_fail "MS GPG key download"; return 1; }
 
     # Add the repo
@@ -292,8 +328,11 @@ install_vscode() {
 deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main
 EOF
 
-    apt update || { record_fail "apt update for vscode"; return 1; }
-    DEBIAN_FRONTEND=noninteractive apt install -y code \
+    gum spin --spinner dot --title "Updating apt for VS Code..." -- \
+        apt-get update \
+        || { record_fail "apt update for vscode"; return 1; }
+    gum spin --spinner dot --title "Installing VS Code..." -- \
+        env DEBIAN_FRONTEND=noninteractive apt-get install -y code \
         || { record_fail "vscode install"; return 1; }
     ok "VS Code installed"
 }
@@ -319,14 +358,17 @@ install_vscode_extensions() {
 install_node_and_clis() {
     hr
     say "Installing Node.js + Claude Code CLI + Codex CLI..."
-    DEBIAN_FRONTEND=noninteractive apt install -y nodejs npm \
+    gum spin --spinner dot --title "Installing Node.js and npm..." -- \
+        env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm \
         || { record_fail "nodejs/npm"; return 1; }
 
     # Install CLIs globally. Note: this puts them in /usr/local/bin
     # (or wherever npm is configured), accessible to all users.
-    npm install -g @anthropic-ai/claude-code \
+    gum spin --spinner dot --title "Installing claude CLI..." -- \
+        npm install -g @anthropic-ai/claude-code \
         || record_fail "claude-code CLI"
-    npm install -g @openai/codex \
+    gum spin --spinner dot --title "Installing codex CLI..." -- \
+        npm install -g @openai/codex \
         || record_fail "codex CLI"
 
     ok "CLIs installed (run 'claude' and 'codex' to authenticate)"
@@ -339,7 +381,8 @@ install_tailscale() {
         ok "Tailscale already installed"
         return 0
     fi
-    curl -fsSL https://tailscale.com/install.sh | sh \
+    gum spin --spinner dot --title "Installing Tailscale..." -- \
+        sh -c 'curl -fsSL https://tailscale.com/install.sh | sh' \
         || record_fail "tailscale install"
     ok "Tailscale installed"
 }
@@ -492,38 +535,48 @@ set_dark_mode
 # ============================================================================
 # Summary
 # ============================================================================
-echo
+printf '\n'
 hr
 if [[ ${#FAILURES[@]} -eq 0 ]]; then
-    printf '%s%s=== Setup complete with no failures ===%s\n' "$BOLD" "$GREEN" "$RESET"
+    gum style \
+        --border rounded \
+        --border-foreground 2 \
+        --padding "1 2" \
+        "$(gum style --bold --foreground 2 "Setup complete — no failures.")"
 else
-    printf '%s%s=== Setup complete with %d warning(s) ===%s\n' "$BOLD" "$YELLOW" "${#FAILURES[@]}" "$RESET"
-    echo "The following steps had issues — you may want to run them manually:"
+    _failure_list=""
     for f in "${FAILURES[@]}"; do
-        echo "  - $f"
+        _failure_list+="  • $f"$'\n'
     done
+    gum style \
+        --border rounded \
+        --border-foreground 3 \
+        --padding "1 2" \
+        "$(gum style --bold --foreground 3 "Setup complete — ${#FAILURES[@]} step(s) had issues:")
+${_failure_list%$'\n'}"
 fi
-echo
-echo "Manual follow-ups:"
-echo "  1. Verify PCIe Gen 3 after reboot:  lspci -vv | grep -iE 'lnksta|speed'"
-echo "  2. Verify USB current setting:       vcgencmd get_config usb_max_current_enable"
-echo "  3. Check RTC after reboot:           timedatectl  (look for 'RTC time')"
-echo "  4. Verify hotspot:                   nmcli device status"
-echo "  5. Sign into VS Code extensions on first open (Claude Code, Codex)"
-echo "  6. Run 'claude' and 'codex' in a terminal to authenticate CLIs"
-echo "  7. Configure chrony+gpsd if you want GPS-disciplined NTP"
-echo
-hr
 
-read -r -p "Run 'sudo tailscale up' now? [y/N]: " resp
-if [[ "$resp" =~ ^[Yy]$ ]]; then
+printf '\n'
+gum style --bold "Manual follow-ups:"
+printf '  1. Verify PCIe Gen 3 after reboot:  lspci -vv | grep -iE '"'"'lnksta|speed'"'"'\n'
+printf '  2. Verify USB current setting:       vcgencmd get_config usb_max_current_enable\n'
+printf '  3. Check RTC after reboot:           timedatectl  (look for '"'"'RTC time'"'"')\n'
+printf '  4. Verify hotspot:                   nmcli device status\n'
+printf '  5. Sign into VS Code extensions on first open (Claude Code, Codex)\n'
+printf '  6. Run '"'"'claude'"'"' and '"'"'codex'"'"' in a terminal to authenticate CLIs\n'
+printf '  7. Configure chrony+gpsd if you want GPS-disciplined NTP\n'
+printf '\n'
+hr
+printf '\n'
+
+if gum confirm --default=false "Run 'sudo tailscale up' now?"; then
     tailscale up || warn "tailscale up didn't complete — run it again manually"
 fi
 
-echo
-read -r -p "Reboot now to apply config.txt changes? [Y/n]: " resp
-if [[ ! "$resp" =~ ^[Nn]$ ]]; then
-    echo "Rebooting in 3 seconds... Ctrl+C to cancel"
+printf '\n'
+if gum confirm --affirmative "Reboot" --negative "Later" \
+        "Reboot now to apply config.txt changes?"; then
+    say "Rebooting in 3 seconds..."
     sleep 3
     reboot
 fi
