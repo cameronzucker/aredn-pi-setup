@@ -10,7 +10,7 @@
 #   4. Enables VNC, I2C, UART via raspi-config (non-interactive)
 #   5. Writes usb_max_current_enable=1 and dtparam=pciex1_gen=3 to config.txt
 #   6. Disables fake-hwclock (Pi 5 has a native RTC powered by CR2032 on the HAT)
-#   7. Warns about RTC battery charging settings
+#   7. Configures RTC battery charging (prompts for battery type)
 #   8. Installs base quality-of-life packages (tmux, git, gh, jq, rg, etc.)
 #   9. Configures UFW firewall (early — limits unprotected exposure window)
 #  10. Installs gpsd, chrony, btop, kdiskmark, nvme-cli
@@ -164,6 +164,25 @@ gum confirm "Proceed with setup?" || { printf 'Aborted.\n'; exit 0; }
 printf '\n'
 
 # ============================================================================
+# Shared config.txt helper
+# ============================================================================
+
+# Write or update a key=value line in a config file.
+# Uses ${line%=*} for key extraction so compound keys like dtparam=rtc_bbat_voltage
+# are matched precisely — avoids clobbering other dtparam= lines.
+_config_set() {
+    local file="$1" line="$2"
+    local key="${line%=*}"
+    local re_key
+    re_key=$(printf '%s' "$key" | sed 's/[[\.*^$()+?{|]/\\&/g')
+    if grep -qE "^\s*${re_key}=" "$file"; then
+        sed -i -E "s|^\s*${re_key}=.*|${line}|" "$file"
+    else
+        echo "$line" >> "$file"
+    fi
+}
+
+# ============================================================================
 # Step functions
 # ============================================================================
 
@@ -204,23 +223,6 @@ config_txt_tweaks() {
 
     cp "$cfg" "${cfg}.bak.$(date +%Y%m%d-%H%M%S)"
 
-    # Helper: ensure a line exists (append if missing).
-    # Uses ${line%=*} (strip last =value) so dtparam=pciex1_gen=3 produces key
-    # "dtparam=pciex1_gen", not "dtparam" — preventing clobber of other dtparam= lines.
-    _ensure_line() {
-        local line="$1"
-        local key="${line%=*}"
-        # Escape regex metacharacters in the key for safe use in grep/sed
-        local re_key
-        re_key=$(printf '%s' "$key" | sed 's/[[\.*^$()+?{|]/\\&/g')
-        if grep -qE "^\s*${re_key}=" "$cfg"; then
-            # Replace any existing value for this exact key
-            sed -i -E "s|^\s*${re_key}=.*|${line}|" "$cfg"
-        else
-            echo "$line" >> "$cfg"
-        fi
-    }
-
     # Append a marker comment once
     if ! grep -q "# Greenfield setup additions" "$cfg"; then
         {
@@ -229,8 +231,8 @@ config_txt_tweaks() {
         } >> "$cfg"
     fi
 
-    _ensure_line "usb_max_current_enable=1"
-    _ensure_line "dtparam=pciex1_gen=3"
+    _config_set "$cfg" "usb_max_current_enable=1"
+    _config_set "$cfg" "dtparam=pciex1_gen=3"
 
     ok "config.txt updated (backup saved)"
 }
@@ -243,23 +245,42 @@ disable_fake_hwclock() {
     ok "fake-hwclock removed"
 }
 
-check_rtc_charging() {
+configure_rtc_battery() {
     hr
-    say "Checking RTC battery charging setting (CR2032 is NOT rechargeable)..."
-    if command -v rpi-eeprom-config >/dev/null 2>&1; then
-        local cfg
-        cfg=$(rpi-eeprom-config 2>/dev/null || true)
-        if echo "$cfg" | grep -qE "^POWER_OFF_ON_HALT=1"; then
-            ok "POWER_OFF_ON_HALT=1 (RTC charging not active)"
-        else
-            warn "Current EEPROM config does NOT have POWER_OFF_ON_HALT=1 set."
-            warn "If a CR2032 is installed, you should set it to prevent charge attempts."
-            warn "Run: sudo -E rpi-eeprom-config --edit"
-            warn "and add 'POWER_OFF_ON_HALT=1' (do NOT set PSU_MAX_CURRENT if using CR2032)."
-        fi
-    else
-        warn "rpi-eeprom-config not found; can't verify RTC battery setting"
-    fi
+    say "Configuring RTC battery charging..."
+
+    local cfg="/boot/firmware/config.txt"
+
+    # dtparam=rtc_bbat_voltage controls the Pi 5 trickle-charge circuit:
+    #   0     = charging disabled (required for non-rechargeable CR2032)
+    #   3000  = charge to 3.0 V  (ML-2020, ML1220 rechargeable cells)
+    local choice
+    choice=$(gum choose \
+        --header "What RTC battery is installed in the J5 connector?" \
+        "CR2032 (non-rechargeable) — disable charging" \
+        "Rechargeable (ML-2020 / ML1220) — enable charging at 3.0 V" \
+        "No battery installed — disable charging" \
+        "Skip") \
+        || { warn "RTC battery config skipped"; return 0; }
+
+    case "$choice" in
+        CR2032*)
+            _config_set "$cfg" "dtparam=rtc_bbat_voltage=0"
+            ok "RTC charging disabled — safe for CR2032"
+            ;;
+        Rechargeable*)
+            _config_set "$cfg" "dtparam=rtc_bbat_voltage=3000"
+            ok "RTC charging enabled at 3.0 V"
+            ;;
+        "No battery"*)
+            _config_set "$cfg" "dtparam=rtc_bbat_voltage=0"
+            ok "RTC charging disabled — no battery present"
+            ;;
+        Skip*)
+            warn "RTC battery config skipped"
+            warn "If using a CR2032, add 'dtparam=rtc_bbat_voltage=0' to /boot/firmware/config.txt"
+            ;;
+    esac
 }
 
 install_base_packages() {
@@ -519,7 +540,7 @@ update_apt
 enable_interfaces
 config_txt_tweaks
 disable_fake_hwclock
-check_rtc_charging
+configure_rtc_battery
 install_base_packages
 setup_firewall        # early — closes exposure window before long downloads
 install_time_gps
