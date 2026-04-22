@@ -318,7 +318,7 @@ mapfile -t INSTALL_SELECTIONS < <(gum choose --no-limit \
 _is_selected() { printf '%s\n' "${INSTALL_SELECTIONS[@]}" | grep -qF "$1"; }
 
 # --- Hotspot config (only if selected) ---
-HOTSPOT_SSID="" HOTSPOT_BAND="bg" HOTSPOT_CHANNEL=0 HOTSPOT_PSK=""
+HOTSPOT_SSID="" HOTSPOT_BAND="bg" HOTSPOT_CHANNEL=0 HOTSPOT_PSK="" HOTSPOT_UPLINK=""
 
 if _is_selected "$_OPT_HOTSPOT"; then
     printf '\n'; hr
@@ -410,6 +410,13 @@ if _is_selected "$_OPT_HOTSPOT"; then
         fi
         break
     done
+
+    # Uplink interface for NAT
+    _detected_uplink=$(ip route show default 2>/dev/null | awk 'NR==1 {print $5}')
+    HOTSPOT_UPLINK=$(gum input \
+        --header "Internet uplink interface (NAT source for hotspot clients)" \
+        --value "${_detected_uplink:-eth0}") || { printf 'Aborted.\n'; exit 0; }
+    [[ -z "$HOTSPOT_UPLINK" ]] && HOTSPOT_UPLINK="${_detected_uplink:-eth0}"
 fi
 
 # --- Configuration summary ---
@@ -424,6 +431,7 @@ SSID:    $HOTSPOT_SSID
 Band:    $_band_display
 Channel: $_ch_display
 PSK:     [${#HOTSPOT_PSK} chars]
+Uplink:  $HOTSPOT_UPLINK
 Subnet:  10.42.0.0/24"
 fi
 
@@ -685,6 +693,22 @@ setup_hotspot() {
         rfkill unblock wifi || warn "rfkill unblock failed; hotspot activation may fail"
     fi
 
+    # --- Internet sharing prerequisites ---
+    # dnsmasq-base: NM needs it to run the DHCP/DNS server for shared connections.
+    # It is a Recommends (not Depends) of network-manager, so it may be absent.
+    gum spin --spinner dot --title "Installing dnsmasq-base..." -- \
+        env DEBIAN_FRONTEND=noninteractive apt-get install -y dnsmasq-base \
+        || warn "dnsmasq-base install failed — hotspot DHCP may not work"
+
+    # IPv4 forwarding: NM shared mode is supposed to enable this, but it does not
+    # persist reliably across UFW resets or race with the UFW systemd unit on boot.
+    printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/99-ipforward.conf
+    sysctl -qw net.ipv4.ip_forward=1
+
+    # DHCP requests arrive from 0.0.0.0 before the client has an IP, so the
+    # 'allow from 10.42.0.0/24' UFW rule does not cover them.
+    ufw allow in on wlan0 to any port 67 proto udp comment 'DHCP for hotspot' >/dev/null 2>&1 || true
+
     nmcli con delete "$HOTSPOT_SSID" 2>/dev/null || true
     mapfile -t _conflicting < <(
         nmcli -t -f NAME,802-11-wireless.mode con show 2>/dev/null \
@@ -698,8 +722,8 @@ setup_hotspot() {
     done
 
     # Build nmcli property arguments; omit wifi.channel when auto (0)
-    # ipv4.method shared: NM sets up dnsmasq DHCP, IP forwarding, and MASQUERADE
-    # on the default-route interface (eth0 for PoE builds).
+    # ipv4.method shared tells NM to run dnsmasq for DHCP/DNS on this interface.
+    # ip_forward and MASQUERADE are handled explicitly below for reliability.
     local nmcli_props=(
         mode ap
         ipv4.method shared
@@ -735,6 +759,29 @@ setup_hotspot() {
     else
         ok "Hotspot '$HOTSPOT_SSID' active on 10.42.0.1/24"
     fi
+
+    # --- Persistent NAT masquerade ---
+    # NM's own shared-mode masquerade rule can be overwritten when UFW resets
+    # iptables on boot (both services race). Write an NM dispatcher script to
+    # re-apply the masquerade every time wlan0 comes up with the hotspot active.
+    local dispatcher=/etc/NetworkManager/dispatcher.d/99-hotspot-nat
+    mkdir -p /etc/NetworkManager/dispatcher.d
+    cat > "$dispatcher" <<EOF
+#!/bin/bash
+[ "\$2" = "up" ] || exit 0
+nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | grep -qF ":wlan0" || exit 0
+sysctl -qw net.ipv4.ip_forward=1
+iptables -t nat -C POSTROUTING -o "${HOTSPOT_UPLINK}" -j MASQUERADE 2>/dev/null || \\
+    iptables -t nat -A POSTROUTING -o "${HOTSPOT_UPLINK}" -j MASQUERADE
+EOF
+    chmod +x "$dispatcher"
+
+    # Apply masquerade immediately (dispatcher only fires on future interface events)
+    iptables -t nat -C POSTROUTING -o "$HOTSPOT_UPLINK" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -o "$HOTSPOT_UPLINK" -j MASQUERADE \
+        || warn "Failed to add NAT masquerade for $HOTSPOT_UPLINK"
+
+    ok "NAT masquerade active (uplink: $HOTSPOT_UPLINK)"
 }
 
 set_dark_mode() {
@@ -830,7 +877,7 @@ gum style --bold "Manual follow-ups:"
 printf '  1. Verify PCIe Gen 3 after reboot:  lspci -vv | grep -iE '"'"'lnksta|speed'"'"'\n'
 printf '  2. Verify USB current setting:       vcgencmd get_config usb_max_current_enable\n'
 printf '  3. Check RTC after reboot:           timedatectl  (look for '"'"'RTC time'"'"')\n'
-printf '  4. Verify hotspot:                   nmcli device status\n'
+printf '  4. Verify hotspot:  nmcli device status  ·  iptables -t nat -L POSTROUTING\n'
 printf '  5. Sign into VS Code extensions on first open (Claude Code, Codex)\n'
 printf '  6. Run '"'"'claude'"'"' and '"'"'codex'"'"' in a terminal to authenticate CLIs\n'
 printf '  7. Configure chrony+gpsd if you want GPS-disciplined NTP\n'
