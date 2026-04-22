@@ -5,24 +5,16 @@
 #
 # What this does (roughly in order):
 #   1. Bootstraps gum (Charm.sh) for interactive UI
-#   2. Prompts for hotspot credentials up front so the rest can run unattended
-#   3. Updates apt & installs prerequisites
-#   4. Enables VNC, I2C, UART via raspi-config (non-interactive)
-#   5. Writes usb_max_current_enable=1 and dtparam=pciex1_gen=3 to config.txt
-#   6. Disables fake-hwclock (Pi 5 has a native RTC powered by CR2032 on the HAT)
-#   7. Configures RTC battery charging (prompts for battery type)
-#   8. Installs base quality-of-life packages (tmux, git, gh, jq, rg, etc.)
-#   9. Configures UFW firewall (early — limits unprotected exposure window)
-#  10. Installs gpsd, chrony, btop, kdiskmark, nvme-cli
-#  11. Installs CAD tools: KiCad, FreeCAD, OpenSCAD, Inkscape
-#  12. Installs VS Code from Microsoft's apt repo
-#  13. Installs VS Code extensions: Claude Code (anthropic.claude-code),
-#       Codex (openai.chatgpt)
-#  14. Installs Node.js and the Claude Code + Codex CLIs via npm
-#  15. Installs Tailscale
-#  16. Creates a WiFi hotspot (eth0 WAN -> wlan0 AP) via NetworkManager
-#  17. Sets dark mode preference via GTK settings
-#  18. Offers to run `tailscale up` and reboot at the end
+#   2. Component picker — choose which software to install
+#   3. Hotspot config (if selected) — SSID, band, channel (auto/scan/manual), PSK
+#   4. Updates apt & installs prerequisites
+#   5. Enables VNC, I2C, UART via raspi-config (non-interactive)
+#   6. Writes usb_max_current_enable=1 and dtparam=pciex1_gen=3 to config.txt
+#   7. Disables fake-hwclock (Pi 5 has a native RTC powered by CR2032 on the HAT)
+#   8. Configures RTC battery charging (prompts for battery type)
+#   9. Configures UFW firewall (always — runs early to close exposure window)
+#  10. Installs selected components
+#  11. Offers to run `tailscale up` and reboot at the end
 #
 # Run with: sudo ./pi5-greenfield-setup.sh
 # Re-running is safe — most steps are idempotent.
@@ -30,7 +22,7 @@
 set -o pipefail
 
 # ============================================================================
-# Output helpers — defined here, require gum (bootstrapped below)
+# Output helpers — require gum (bootstrapped below)
 # ============================================================================
 say()  { gum style --foreground 4 "==> $*"; }
 ok()   { gum style --foreground 2 " ✓  $*"; }
@@ -38,7 +30,6 @@ warn() { gum style --foreground 3 " ⚠  $*" >&2; }
 err()  { gum style --foreground 1 " ✗  $*" >&2; }
 hr()   { gum style --foreground 8 "────────────────────────────────────────────────────────────"; }
 
-# Track failures so we can summarize at the end rather than halt on first hiccup.
 FAILURES=()
 record_fail() { FAILURES+=("$1"); }
 
@@ -64,21 +55,18 @@ if [[ ! -d "$USER_HOME" ]]; then
     exit 1
 fi
 
-# Run a command as the target user, preserving their environment
 as_user() { sudo -u "$USER_NAME" -H "$@"; }
 
 # ============================================================================
-# Bootstrap gum (Charm.sh) — required for all interactive UI below
+# Bootstrap gum (Charm.sh)
 # ============================================================================
 _bootstrap_gum() {
     command -v gum >/dev/null 2>&1 && return 0
     printf 'Installing gum (required for interactive UI)...\n'
-    # Try system apt cache first — gum is in Debian Trixie/Sid repos
     if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gum \
             >/dev/null 2>&1; then
         return 0
     fi
-    # Fallback: Charm's official apt repo
     printf 'Not found in apt — adding Charm repo...\n'
     mkdir -p /etc/apt/keyrings
     curl -fsSL https://repo.charm.sh/apt/gpg.key \
@@ -93,7 +81,7 @@ _bootstrap_gum() {
 _bootstrap_gum
 
 # ============================================================================
-# Pi / OS checks (gum now available)
+# Pi / OS checks
 # ============================================================================
 if ! grep -q "Raspberry Pi 5" /proc/cpuinfo 2>/dev/null \
    && ! grep -q "Raspberry Pi 5" /proc/device-tree/model 2>/dev/null; then
@@ -107,69 +95,12 @@ if ! grep -q "trixie" /etc/os-release 2>/dev/null; then
 fi
 
 # ============================================================================
-# Collect interactive input up front
-# ============================================================================
-hr
-gum style --bold --foreground 4 "  Pi 5 Greenfield Setup  "
-printf '\n'
-say "Collecting config up front so the rest can run unattended."
-say "Target user: $USER_NAME  (home: $USER_HOME)"
-printf '\n'
-
-HOTSPOT_SSID=$(gum input \
-    --header "Hotspot SSID" \
-    --placeholder "PiField" \
-    --value "PiField") \
-    || { printf 'Aborted.\n'; exit 0; }
-
-HOTSPOT_CHANNEL=$(gum input \
-    --header "Hotspot channel (2.4 GHz, 1–11)" \
-    --placeholder "6" \
-    --value "6") \
-    || { printf 'Aborted.\n'; exit 0; }
-
-if ! [[ "$HOTSPOT_CHANNEL" =~ ^[0-9]+$ ]] || (( HOTSPOT_CHANNEL < 1 || HOTSPOT_CHANNEL > 11 )); then
-    err "Hotspot channel must be 1–11 (got: '$HOTSPOT_CHANNEL')"
-    exit 1
-fi
-
-while true; do
-    HOTSPOT_PSK=$(gum input --password \
-        --header "Hotspot WPA2 passphrase (min 8 chars)") \
-        || { printf 'Aborted.\n'; exit 0; }
-    if [[ ${#HOTSPOT_PSK} -lt 8 ]]; then
-        warn "Passphrase must be at least 8 characters."
-        continue
-    fi
-    HOTSPOT_PSK2=$(gum input --password \
-        --header "Confirm passphrase") \
-        || { printf 'Aborted.\n'; exit 0; }
-    if [[ "$HOTSPOT_PSK" != "$HOTSPOT_PSK2" ]]; then
-        warn "Passphrases don't match — try again."
-        continue
-    fi
-    break
-done
-
-printf '\n'
-gum style \
-    --border rounded \
-    --border-foreground 4 \
-    --padding "1 2" \
-    "$(printf 'User:    %s\nSSID:    %s\nChannel: %s (2.4 GHz)\nPSK:     [%d chars]\nSubnet:  10.42.0.0/24' \
-        "$USER_NAME" "$HOTSPOT_SSID" "$HOTSPOT_CHANNEL" "${#HOTSPOT_PSK}")"
-printf '\n'
-
-gum confirm "Proceed with setup?" || { printf 'Aborted.\n'; exit 0; }
-printf '\n'
-
-# ============================================================================
-# Shared config.txt helper
+# Shared helpers
 # ============================================================================
 
 # Write or update a key=value line in a config file.
 # Uses ${line%=*} for key extraction so compound keys like dtparam=rtc_bbat_voltage
-# are matched precisely — avoids clobbering other dtparam= lines.
+# are matched precisely, avoiding clobber of other dtparam= lines.
 _config_set() {
     local file="$1" line="$2"
     local key="${line%=*}"
@@ -182,6 +113,272 @@ _config_set() {
     fi
 }
 
+# Scan nearby WiFi networks and display a channel congestion table.
+# Outputs the recommended channel number on stdout; table goes to stderr.
+# Args: band_ghz — "2.4" or "5"
+_wifi_scan_channels() {
+    local band_ghz="$1"
+
+    # Bring wlan0 up temporarily if needed
+    ip link set wlan0 up 2>/dev/null || true
+
+    # Scan into a temp file so we can capture output while showing a spinner
+    local tmp; tmp=$(mktemp)
+    gum spin --spinner dot --title "Scanning nearby networks…" -- \
+        sh -c "iw dev wlan0 scan 2>/dev/null > '$tmp'" 2>/dev/null || true
+    local scan_raw; scan_raw=$(cat "$tmp"); rm -f "$tmp"
+
+    # Parse frequencies → per-channel AP counts
+    declare -A ch_count
+    local freq ch total=0
+    while IFS= read -r freq; do
+        if [[ "$band_ghz" == "2.4" ]] && (( freq >= 2412 && freq <= 2484 )); then
+            ch=$(( (freq - 2407) / 5 ))
+            (( ch_count[$ch]++ )) || true; (( total++ )) || true
+        elif [[ "$band_ghz" == "5" ]] && (( freq >= 5170 && freq <= 5885 )); then
+            ch=$(( (freq - 5000) / 5 ))
+            (( ch_count[$ch]++ )) || true; (( total++ )) || true
+        fi
+    done < <(printf '%s\n' "$scan_raw" | awk '/freq:/ { print $2 }')
+
+    local max_count=1
+    for ch in "${!ch_count[@]}"; do
+        (( ch_count[$ch] > max_count )) && max_count=${ch_count[$ch]}
+    done
+
+    # Build table and pick recommended channel
+    local table="" recommended="" min_seen=99999
+    local n filled bar i note
+
+    if [[ "$band_ghz" == "2.4" ]]; then
+        local preferred=(1 6 11)
+        local all_chs=(1 2 3 4 5 6 7 8 9 10 11)
+
+        # Least busy among non-overlapping channels
+        for ch in "${preferred[@]}"; do
+            n=${ch_count[$ch]:-0}
+            (( n < min_seen )) && { min_seen=$n; recommended=$ch; }
+        done
+
+        for ch in "${all_chs[@]}"; do
+            n=${ch_count[$ch]:-0}
+            filled=$(( max_count > 0 ? n * 10 / max_count : 0 ))
+            bar=""; for (( i=0; i<10; i++ )); do
+                (( i < filled )) && bar+="▓" || bar+="░"
+            done
+            local pref=" "
+            for p in "${preferred[@]}"; do [[ "$p" == "$ch" ]] && pref="*"; done
+            note=""; [[ "$ch" == "$recommended" ]] && note="  ← recommended"
+            table+=$(printf ' Ch %2d%s  %s  %2d AP%s%s\n' \
+                "$ch" "$pref" "$bar" "$n" \
+                "$([[ $n -ne 1 ]] && printf 's')" "$note")
+        done
+        table+=$'\n * = non-overlapping channels — prefer 1, 6, or 11 to minimise interference'
+
+    else  # 5 GHz
+        local non_dfs=(36 40 44 48 149 153 157 161 165)
+        local dfs=(52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 144)
+
+        for ch in "${non_dfs[@]}"; do
+            n=${ch_count[$ch]:-0}
+            (( n < min_seen )) && { min_seen=$n; recommended=$ch; }
+        done
+
+        for ch in "${non_dfs[@]}" "${dfs[@]}"; do
+            n=${ch_count[$ch]:-0}
+            filled=$(( max_count > 0 ? n * 10 / max_count : 0 ))
+            bar=""; for (( i=0; i<10; i++ )); do
+                (( i < filled )) && bar+="▓" || bar+="░"
+            done
+            local dfs_mark="    "
+            for d in "${dfs[@]}"; do [[ "$d" == "$ch" ]] && dfs_mark=" DFS"; done
+            note=""; [[ "$ch" == "$recommended" ]] && note="  ← recommended"
+            table+=$(printf ' Ch %3d%s  %s  %2d AP%s%s\n' \
+                "$ch" "$dfs_mark" "$bar" "$n" \
+                "$([[ $n -ne 1 ]] && printf 's')" "$note")
+        done
+        table+=$'\n DFS = radar-detection channels — many Pi drivers restrict AP use on these'
+    fi
+
+    # Render table to stderr (visible in terminal, not captured by caller)
+    gum style \
+        --border rounded \
+        --border-foreground 4 \
+        --padding "1 2" \
+        "$(gum style --bold "  ${band_ghz} GHz channel survey — ${total} network(s) found  ")
+
+$table" >&2
+    printf '\n' >&2
+
+    # Return recommended channel on stdout
+    printf '%s' "$recommended"
+}
+
+# ============================================================================
+# Interactive input — component picker + hotspot config
+# ============================================================================
+hr
+gum style --bold --foreground 4 "  Pi 5 Greenfield Setup  "
+printf '\n'
+say "Target user: $USER_NAME  (home: $USER_HOME)"
+printf '\n'
+
+# --- Component picker ---
+# Option labels use · instead of commas so --selected parsing (comma-split) is safe
+_OPT_BASE="[base]   Base packages       tmux · git · gh · btop · ripgrep · jq · ncdu"
+_OPT_GPS="[gps]    GPS / NTP           gpsd · gpsd-clients · pps-tools · chrony"
+_OPT_KDISK="[disk]   KDiskMark           disk benchmark"
+_OPT_CAD="[cad]    CAD tools           KiCad · FreeCAD · OpenSCAD · Inkscape  (~1 GB)"
+_OPT_VSCODE="[code]   VS Code             Microsoft apt repo"
+_OPT_VSEXT="[ext]    VS Code extensions  Claude Code · Codex"
+_OPT_NODE="[node]   Node.js + AI CLIs   claude · codex"
+_OPT_TS="[ts]     Tailscale           VPN"
+_OPT_HOTSPOT="[wifi]   WiFi hotspot        eth0 → wlan0 AP"
+_OPT_DARK="[dark]   Dark mode           GTK 3 / 4"
+
+mapfile -t INSTALL_SELECTIONS < <(gum choose --no-limit \
+    --header "Space to toggle  ·  Enter to confirm" \
+    --selected="$_OPT_BASE,$_OPT_GPS,$_OPT_VSCODE,$_OPT_VSEXT,$_OPT_NODE,$_OPT_TS,$_OPT_HOTSPOT,$_OPT_DARK" \
+    "$_OPT_BASE" \
+    "$_OPT_GPS" \
+    "$_OPT_KDISK" \
+    "$_OPT_CAD" \
+    "$_OPT_VSCODE" \
+    "$_OPT_VSEXT" \
+    "$_OPT_NODE" \
+    "$_OPT_TS" \
+    "$_OPT_HOTSPOT" \
+    "$_OPT_DARK") || { printf 'Aborted.\n'; exit 0; }
+
+_is_selected() { printf '%s\n' "${INSTALL_SELECTIONS[@]}" | grep -qF "$1"; }
+
+# --- Hotspot config (only if selected) ---
+HOTSPOT_SSID="" HOTSPOT_BAND="bg" HOTSPOT_CHANNEL=0 HOTSPOT_PSK=""
+
+if _is_selected "$_OPT_HOTSPOT"; then
+    printf '\n'; hr
+    say "WiFi hotspot configuration"
+    printf '\n'
+
+    HOTSPOT_SSID=$(gum input \
+        --header "Hotspot SSID" \
+        --placeholder "PiField" \
+        --value "PiField") || { printf 'Aborted.\n'; exit 0; }
+
+    # Band
+    _band_choice=$(gum choose \
+        --header "WiFi band" \
+        "2.4 GHz  (b/g/n — better range · broader device compatibility)" \
+        "5 GHz    (a/n/ac — faster · less crowded)") \
+        || { printf 'Aborted.\n'; exit 0; }
+
+    if [[ "$_band_choice" == 5* ]]; then
+        HOTSPOT_BAND="a"; _band_ghz="5"
+    else
+        HOTSPOT_BAND="bg"; _band_ghz="2.4"
+    fi
+
+    # Channel
+    _ch_mode=$(gum choose \
+        --header "Channel selection" \
+        "Auto    (driver picks best available channel)" \
+        "Scan    (survey nearby networks and recommend)" \
+        "Manual  (enter a specific channel number)") \
+        || { printf 'Aborted.\n'; exit 0; }
+
+    case "$_ch_mode" in
+        Auto*)
+            HOTSPOT_CHANNEL=0
+            ok "Channel: auto"
+            ;;
+        Scan*)
+            printf '\n'
+            if ip link show wlan0 >/dev/null 2>&1 && command -v iw >/dev/null 2>&1; then
+                _recommended=$(_wifi_scan_channels "$_band_ghz")
+                if [[ -n "$_recommended" ]]; then
+                    if gum confirm --default=true "Use recommended channel $_recommended?"; then
+                        HOTSPOT_CHANNEL=$_recommended
+                    else
+                        HOTSPOT_CHANNEL=$(gum input \
+                            --header "Enter channel number" \
+                            --value "$_recommended") \
+                            || { printf 'Aborted.\n'; exit 0; }
+                    fi
+                else
+                    warn "Scan returned no results — falling back to Auto"
+                    HOTSPOT_CHANNEL=0
+                fi
+            else
+                warn "wlan0 not available or 'iw' not installed — falling back to Auto"
+                HOTSPOT_CHANNEL=0
+            fi
+            ;;
+        Manual*)
+            if [[ "$HOTSPOT_BAND" == "bg" ]]; then
+                _ch_hint="1–11 for 2.4 GHz"
+            else
+                _ch_hint="e.g. 36 · 40 · 44 · 48 · 149 · 153 · 157 · 161 · 165 for 5 GHz"
+            fi
+            HOTSPOT_CHANNEL=$(gum input \
+                --header "Channel ($_ch_hint)" \
+                --placeholder "6") \
+                || { printf 'Aborted.\n'; exit 0; }
+            ;;
+    esac
+
+    # PSK
+    while true; do
+        HOTSPOT_PSK=$(gum input --password \
+            --header "Hotspot WPA2 passphrase (min 8 chars)") \
+            || { printf 'Aborted.\n'; exit 0; }
+        if [[ ${#HOTSPOT_PSK} -lt 8 ]]; then
+            warn "Passphrase must be at least 8 characters."
+            continue
+        fi
+        HOTSPOT_PSK2=$(gum input --password \
+            --header "Confirm passphrase") \
+            || { printf 'Aborted.\n'; exit 0; }
+        if [[ "$HOTSPOT_PSK" != "$HOTSPOT_PSK2" ]]; then
+            warn "Passphrases don't match — try again."
+            continue
+        fi
+        break
+    done
+fi
+
+# --- Configuration summary ---
+printf '\n'
+_ch_display="$([[ "$HOTSPOT_CHANNEL" == "0" ]] && printf 'auto' || printf '%s' "$HOTSPOT_CHANNEL")"
+_band_display="$([[ "$HOTSPOT_BAND" == "a" ]] && printf '5 GHz (a/n/ac)' || printf '2.4 GHz (b/g/n)')"
+
+_summary_wifi=""
+if _is_selected "$_OPT_HOTSPOT"; then
+    _summary_wifi="
+SSID:    $HOTSPOT_SSID
+Band:    $_band_display
+Channel: $_ch_display
+PSK:     [${#HOTSPOT_PSK} chars]
+Subnet:  10.42.0.0/24"
+fi
+
+_summary_components=""
+for _s in "${INSTALL_SELECTIONS[@]}"; do
+    _summary_components+="  • $_s"$'\n'
+done
+
+gum style \
+    --border rounded \
+    --border-foreground 4 \
+    --padding "1 2" \
+    "$(printf 'User:    %s%s' "$USER_NAME" "$_summary_wifi")
+
+Installing:
+${_summary_components%$'\n'}"
+printf '\n'
+
+gum confirm "Proceed with setup?" || { printf 'Aborted.\n'; exit 0; }
+printf '\n'
+
 # ============================================================================
 # Step functions
 # ============================================================================
@@ -192,10 +389,11 @@ update_apt() {
     gum spin --spinner dot --title "Running apt update..." -- \
         apt-get update \
         || { record_fail "apt update"; return 1; }
+    # ufw included here so setup_firewall always has it regardless of component selection
     gum spin --spinner dot --title "Installing prerequisites..." -- \
         env DEBIAN_FRONTEND=noninteractive apt-get install -y \
             lsb-release curl wget gpg apt-transport-https ca-certificates \
-            software-properties-common gnupg \
+            software-properties-common gnupg ufw iw \
         || { record_fail "prereq packages"; return 1; }
     ok "apt ready"
 }
@@ -223,12 +421,8 @@ config_txt_tweaks() {
 
     cp "$cfg" "${cfg}.bak.$(date +%Y%m%d-%H%M%S)"
 
-    # Append a marker comment once
     if ! grep -q "# Greenfield setup additions" "$cfg"; then
-        {
-            echo ""
-            echo "# Greenfield setup additions"
-        } >> "$cfg"
+        { echo ""; echo "# Greenfield setup additions"; } >> "$cfg"
     fi
 
     _config_set "$cfg" "usb_max_current_enable=1"
@@ -253,7 +447,7 @@ configure_rtc_battery() {
 
     # dtparam=rtc_bbat_voltage controls the Pi 5 trickle-charge circuit:
     #   0     = charging disabled (required for non-rechargeable CR2032)
-    #   3000  = charge to 3.0 V  (ML-2020, ML1220 rechargeable cells)
+    #   3000  = charge to 3.0 V  (ML-2020 / ML1220 rechargeable cells)
     local choice
     choice=$(gum choose \
         --header "What RTC battery is installed in the J5 connector?" \
@@ -299,11 +493,10 @@ install_base_packages() {
 install_time_gps() {
     hr
     say "Installing gpsd and chrony..."
-    gum spin --spinner dot --title "Installing gpsd, gpsd-clients, pps-tools, chrony..." -- \
+    gum spin --spinner dot --title "Installing gpsd · gpsd-clients · pps-tools · chrony..." -- \
         env DEBIAN_FRONTEND=noninteractive apt-get install -y \
             gpsd gpsd-clients pps-tools chrony \
         || record_fail "gpsd/chrony"
-    # Leave services as installed; user will configure them for their GPS setup
     ok "gpsd + chrony installed (manual configuration required for GPS NTP)"
 }
 
@@ -338,13 +531,11 @@ install_vscode() {
         return 0
     fi
 
-    # Import Microsoft signing key
     gum spin --spinner dot --title "Fetching Microsoft GPG key..." -- \
         sh -c 'wget -qO- https://packages.microsoft.com/keys/microsoft.asc \
             | gpg --dearmor > /usr/share/keyrings/packages.microsoft.gpg' \
         || { record_fail "MS GPG key download"; return 1; }
 
-    # Add the repo
     cat > /etc/apt/sources.list.d/vscode.list <<EOF
 deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main
 EOF
@@ -367,7 +558,6 @@ install_vscode_extensions() {
         return 1
     fi
 
-    # Extensions are installed per-user, so run as the target user
     as_user code --install-extension anthropic.claude-code --force \
         || record_fail "Claude Code extension"
     as_user code --install-extension openai.chatgpt --force \
@@ -383,8 +573,6 @@ install_node_and_clis() {
         env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm \
         || { record_fail "nodejs/npm"; return 1; }
 
-    # Install CLIs globally. Note: this puts them in /usr/local/bin
-    # (or wherever npm is configured), accessible to all users.
     gum spin --spinner dot --title "Installing claude CLI..." -- \
         npm install -g @anthropic-ai/claude-code \
         || record_fail "claude-code CLI"
@@ -410,7 +598,7 @@ install_tailscale() {
 
 setup_hotspot() {
     hr
-    say "Creating '$HOTSPOT_SSID' WiFi hotspot (eth0 WAN -> wlan0 AP)..."
+    say "Creating '$HOTSPOT_SSID' WiFi hotspot..."
 
     if ! command -v nmcli >/dev/null 2>&1; then
         err "NetworkManager (nmcli) not found — can't configure hotspot"
@@ -418,7 +606,6 @@ setup_hotspot() {
         return 1
     fi
 
-    # Bail early if wlan0 doesn't exist — Pi may not have WiFi enabled yet
     if ! ip link show wlan0 >/dev/null 2>&1; then
         warn "wlan0 interface not found — skipping hotspot setup"
         warn "Enable WiFi in raspi-config or via 'rfkill unblock wifi', then re-run"
@@ -427,15 +614,11 @@ setup_hotspot() {
         return 1
     fi
 
-    # Unblock WiFi if rfkill has it soft-blocked
     if rfkill list wifi 2>/dev/null | grep -q "Soft blocked: yes"; then
         say "WiFi is soft-blocked — unblocking via rfkill..."
         rfkill unblock wifi || warn "rfkill unblock failed; hotspot activation may fail"
     fi
 
-    # Remove our own profile for a clean slate, then find and remove any other
-    # AP-mode profiles — a manually configured hotspot with a different name
-    # will block activation even if ours is created successfully.
     nmcli con delete "$HOTSPOT_SSID" 2>/dev/null || true
     mapfile -t _conflicting < <(
         nmcli -t -f NAME,802-11-wireless.mode con show 2>/dev/null \
@@ -448,9 +631,26 @@ setup_hotspot() {
         nmcli con delete "$_con" 2>/dev/null || true
     done
 
-    # ipv4.method shared: NetworkManager automatically sets up dnsmasq for DHCP,
-    # enables IP forwarding, and adds MASQUERADE rules to route traffic out
-    # the default-route interface (eth0 for a PoE build).
+    # Build nmcli property arguments; omit wifi.channel when auto (0)
+    # ipv4.method shared: NM sets up dnsmasq DHCP, IP forwarding, and MASQUERADE
+    # on the default-route interface (eth0 for PoE builds).
+    local nmcli_props=(
+        mode ap
+        ipv4.method shared
+        ipv4.addresses 10.42.0.1/24
+        wifi.band "$HOTSPOT_BAND"
+        wifi-sec.key-mgmt wpa-psk
+        wifi-sec.psk "$HOTSPOT_PSK"
+        wifi-sec.pmf disable
+    )
+    [[ "$HOTSPOT_CHANNEL" != "0" ]] && nmcli_props+=(wifi.channel "$HOTSPOT_CHANNEL")
+
+    local _band_label
+    [[ "$HOTSPOT_BAND" == "a" ]] && _band_label="5 GHz" || _band_label="2.4 GHz"
+    local _ch_label
+    [[ "$HOTSPOT_CHANNEL" == "0" ]] && _ch_label="auto" || _ch_label="ch $HOTSPOT_CHANNEL"
+    say "  Band: $_band_label · Channel: $_ch_label · Subnet: 10.42.0.1/24"
+
     nmcli con add \
         type wifi \
         ifname wlan0 \
@@ -458,14 +658,7 @@ setup_hotspot() {
         autoconnect yes \
         ssid "$HOTSPOT_SSID" \
         -- \
-        mode ap \
-        ipv4.method shared \
-        ipv4.addresses 10.42.0.1/24 \
-        wifi.band bg \
-        wifi.channel "$HOTSPOT_CHANNEL" \
-        wifi-sec.key-mgmt wpa-psk \
-        wifi-sec.psk "$HOTSPOT_PSK" \
-        wifi-sec.pmf disable \
+        "${nmcli_props[@]}" \
         || { record_fail "hotspot create"; return 1; }
 
     if ! nmcli con up "$HOTSPOT_SSID" 2>/dev/null; then
@@ -482,76 +675,67 @@ set_dark_mode() {
     hr
     say "Setting dark mode via GTK settings..."
 
-    # GTK-3
     as_user mkdir -p "$USER_HOME/.config/gtk-3.0"
     as_user tee "$USER_HOME/.config/gtk-3.0/settings.ini" >/dev/null <<'EOF'
 [Settings]
 gtk-application-prefer-dark-theme=1
 EOF
 
-    # GTK-4
     as_user mkdir -p "$USER_HOME/.config/gtk-4.0"
     as_user tee "$USER_HOME/.config/gtk-4.0/settings.ini" >/dev/null <<'EOF'
 [Settings]
 gtk-application-prefer-dark-theme=1
 EOF
 
-    # Also try gsettings for apps that read from there. This may fail under
-    # SSH without an active session — that's fine, the settings.ini files
-    # above handle the persistent case.
     as_user dbus-launch gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark' 2>/dev/null || true
 
     ok "Dark mode set (takes effect at next graphical login)"
-    warn "On Pi OS Desktop, run 'pi-appearance' to pick a specific dark theme if the default doesn't look right"
+    warn "On Pi OS Desktop, run 'pi-appearance' to pick a specific dark theme if needed"
 }
 
 setup_firewall() {
     hr
     say "Configuring UFW firewall..."
 
-    # Reset to a known state first
     ufw --force reset >/dev/null 2>&1 || true
-
     ufw default deny incoming
     ufw default allow outgoing
-    # Allow forwarded traffic — needed for the hotspot NAT to work
     ufw default allow routed 2>/dev/null || true
 
-    # Core services
     ufw allow ssh                  comment 'SSH'
     ufw allow 80/tcp               comment 'HTTP'
     ufw allow 443/tcp              comment 'HTTPS'
     ufw allow 5900/tcp             comment 'VNC'
-
-    # Hotspot clients — trust the AP subnet
     ufw allow from 10.42.0.0/24    comment 'Hotspot clients'
-
-    # Tailscale manages its own interface; allow anything over tailscale0
     ufw allow in on tailscale0     comment 'Tailscale VPN' 2>/dev/null || true
 
     ufw --force enable >/dev/null
-    ok "UFW enabled (ssh, http/s, vnc, hotspot, tailscale)"
+    ok "UFW enabled (ssh · http/s · vnc · hotspot subnet · tailscale)"
 }
 
 # ============================================================================
 # Main flow
 # ============================================================================
+
+# Always: core system configuration
 update_apt
 enable_interfaces
 config_txt_tweaks
 disable_fake_hwclock
 configure_rtc_battery
-install_base_packages
-setup_firewall        # early — closes exposure window before long downloads
-install_time_gps
-install_kdiskmark
-install_cad_tools
-install_vscode
-install_vscode_extensions
-install_node_and_clis
-install_tailscale
-setup_hotspot
-set_dark_mode
+setup_firewall
+
+# Optional: selected components
+_is_selected "$_OPT_BASE"    && install_base_packages
+_is_selected "$_OPT_GPS"     && install_time_gps
+_is_selected "$_OPT_KDISK"   && install_kdiskmark
+_is_selected "$_OPT_CAD"     && install_cad_tools
+_is_selected "$_OPT_VSCODE"  && install_vscode
+_is_selected "$_OPT_VSEXT"   && install_vscode_extensions
+_is_selected "$_OPT_NODE"    && install_node_and_clis
+_is_selected "$_OPT_TS"      && install_tailscale
+_is_selected "$_OPT_HOTSPOT" && setup_hotspot
+_is_selected "$_OPT_DARK"    && set_dark_mode
 
 # ============================================================================
 # Summary
@@ -566,9 +750,7 @@ if [[ ${#FAILURES[@]} -eq 0 ]]; then
         "$(gum style --bold --foreground 2 "Setup complete — no failures.")"
 else
     _failure_list=""
-    for f in "${FAILURES[@]}"; do
-        _failure_list+="  • $f"$'\n'
-    done
+    for f in "${FAILURES[@]}"; do _failure_list+="  • $f"$'\n'; done
     gum style \
         --border rounded \
         --border-foreground 3 \
@@ -590,11 +772,13 @@ printf '\n'
 hr
 printf '\n'
 
-if gum confirm --default=false "Run 'sudo tailscale up' now?"; then
-    tailscale up || warn "tailscale up didn't complete — run it again manually"
+if _is_selected "$_OPT_TS"; then
+    if gum confirm --default=false "Run 'sudo tailscale up' now?"; then
+        tailscale up || warn "tailscale up didn't complete — run it again manually"
+    fi
+    printf '\n'
 fi
 
-printf '\n'
 if gum confirm --affirmative "Reboot" --negative "Later" \
         "Reboot now to apply config.txt changes?"; then
     say "Rebooting in 3 seconds..."
