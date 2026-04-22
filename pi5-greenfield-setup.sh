@@ -223,9 +223,19 @@ _wifi_scan_channels() {
         local non_dfs_3=(149 153 157 161 165)
         local dfs=(52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 144)
 
+        # Score each candidate: own_count*1000 + 80 MHz bonding group total.
+        # This penalises a clear channel whose group neighbours are busy
+        # (e.g. ch 36 looks clear but sits in a crowded 36/40/44/48 block).
+        local best_score=99999999 gc grp_total score
         for ch in "${non_dfs_1[@]}" "${non_dfs_3[@]}"; do
             n=${ch_count[$ch]:-0}
-            (( n < min_seen )) && { min_seen=$n; recommended=$ch; }
+            grp_total=0
+            case "$ch" in
+                36|40|44|48)         for gc in 36 40 44 48;         do (( grp_total += ${ch_count[$gc]:-0} )); done ;;
+                149|153|157|161|165) for gc in 149 153 157 161 165; do (( grp_total += ${ch_count[$gc]:-0} )); done ;;
+            esac
+            score=$(( n * 1000 + grp_total ))
+            (( score < best_score )) && { best_score=$score; recommended=$ch; }
         done
 
         table+="  -- UNII-1 (ch 36-48, non-DFS) --"$'\n'
