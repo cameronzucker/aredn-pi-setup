@@ -354,8 +354,35 @@ setup_hotspot() {
         return 1
     fi
 
-    # Remove any existing profile with this name so we start clean
+    # Bail early if wlan0 doesn't exist — Pi may not have WiFi enabled yet
+    if ! ip link show wlan0 >/dev/null 2>&1; then
+        warn "wlan0 interface not found — skipping hotspot setup"
+        warn "Enable WiFi in raspi-config or via 'rfkill unblock wifi', then re-run"
+        warn "Or activate later with: sudo nmcli con up '$HOTSPOT_SSID'"
+        record_fail "hotspot (wlan0 missing)"
+        return 1
+    fi
+
+    # Unblock WiFi if rfkill has it soft-blocked
+    if rfkill list wifi 2>/dev/null | grep -q "Soft blocked: yes"; then
+        say "WiFi is soft-blocked — unblocking via rfkill..."
+        rfkill unblock wifi || warn "rfkill unblock failed; hotspot activation may fail"
+    fi
+
+    # Remove our own profile for a clean slate, then find and remove any other
+    # AP-mode profiles — a manually configured hotspot with a different name
+    # will block activation even if ours is created successfully.
     nmcli con delete "$HOTSPOT_SSID" 2>/dev/null || true
+    mapfile -t _conflicting < <(
+        nmcli -t -f NAME,802-11-wireless.mode con show 2>/dev/null \
+            | awk -F: 'tolower($2) == "ap" { print $1 }' \
+            | grep -Fxv "$HOTSPOT_SSID" || true
+    )
+    for _con in "${_conflicting[@]}"; do
+        [[ -z "$_con" ]] && continue
+        say "  Removing conflicting AP profile: '$_con'"
+        nmcli con delete "$_con" 2>/dev/null || true
+    done
 
     # ipv4.method shared: NetworkManager automatically sets up dnsmasq for DHCP,
     # enables IP forwarding, and adds MASQUERADE rules to route traffic out
@@ -377,11 +404,11 @@ setup_hotspot() {
         wifi-sec.pmf disable \
         || { record_fail "hotspot create"; return 1; }
 
-    # Try to bring it up now. This will fail if wlan0 is being used as a
-    # client connection — which is fine, we just note it.
-    if ! nmcli con up "$HOTSPOT_SSID" 2>&1; then
-        warn "Hotspot created but didn't activate (wlan0 may be in use by another connection)"
-        warn "You can activate it later with: sudo nmcli con up $HOTSPOT_SSID"
+    if ! nmcli con up "$HOTSPOT_SSID" 2>/dev/null; then
+        warn "Hotspot profile created but didn't activate"
+        warn "  Check interface:  nmcli device status"
+        warn "  Check rfkill:     rfkill list"
+        warn "  Activate later:   sudo nmcli con up '$HOTSPOT_SSID'"
     else
         ok "Hotspot '$HOTSPOT_SSID' active on 10.42.0.1/24"
     fi
