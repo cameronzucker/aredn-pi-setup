@@ -113,105 +113,145 @@ _config_set() {
     fi
 }
 
-# Scan nearby WiFi networks and display a channel congestion table.
-# Outputs the recommended channel number on stdout; table goes to stderr.
+# Global set by _wifi_scan_channels — avoids subshell so gum spin renders correctly.
+SCAN_RECOMMENDED_CHANNEL=""
+
+# Render one bar-graph row.  All data passed as args so $() subshell works without
+# needing to inherit associative arrays (which bash doesn't export to subshells).
+# Args: label mark n sig bar_width max_count recommended ch
+_channel_bar_row() {
+    local label="$1" mark="$2" n="$3" sig="$4" bw="$5" max_c="$6" rec="$7" ch="$8"
+    local filled=$(( max_c > 0 ? n * bw / max_c : 0 ))
+    local bar="" i
+    for (( i=0; i<bw; i++ )); do
+        (( i < filled )) && bar+="█" || bar+="-"
+    done
+    local note="" sig_disp=""
+    [[ "$ch" == "$rec" ]] && note="  <- recommended"
+    (( n > 0 )) && sig_disp="  sig:${sig}%"
+    printf '%s%s  [%s]  %2d AP%s%s%s\n' \
+        "$label" "$mark" "$bar" "$n" \
+        "$( (( n != 1 )) && printf 's' || true )" \
+        "$sig_disp" "$note"
+}
+
+# Scan nearby WiFi networks via nmcli and display a channel congestion bar chart.
+# Sets SCAN_RECOMMENDED_CHANNEL (global) rather than writing to stdout, so the
+# gum spin spinner is visible when called from the interactive hotspot config flow.
 # Args: band_ghz — "2.4" or "5"
 _wifi_scan_channels() {
     local band_ghz="$1"
+    SCAN_RECOMMENDED_CHANNEL=""
 
-    # Bring wlan0 up temporarily if needed
-    ip link set wlan0 up 2>/dev/null || true
-
-    # Scan into a temp file so we can capture output while showing a spinner
-    local tmp; tmp=$(mktemp)
+    # NetworkManager owns wlan0 — use nmcli rather than iw to avoid scan failures
     gum spin --spinner dot --title "Scanning nearby networks…" -- \
-        sh -c "iw dev wlan0 scan 2>/dev/null > '$tmp'" 2>/dev/null || true
-    local scan_raw; scan_raw=$(cat "$tmp"); rm -f "$tmp"
+        nmcli device wifi rescan ifname wlan0 2>/dev/null || true
 
-    # Parse frequencies → per-channel AP counts
-    declare -A ch_count
-    local freq ch total=0
-    while IFS= read -r freq; do
-        if [[ "$band_ghz" == "2.4" ]] && (( freq >= 2412 && freq <= 2484 )); then
-            ch=$(( (freq - 2407) / 5 ))
-            (( ch_count[$ch]++ )) || true; (( total++ )) || true
-        elif [[ "$band_ghz" == "5" ]] && (( freq >= 5170 && freq <= 5885 )); then
-            ch=$(( (freq - 5000) / 5 ))
-            (( ch_count[$ch]++ )) || true; (( total++ )) || true
+    local scan_data
+    scan_data=$(nmcli -t -f CHAN,SIGNAL device wifi list ifname wlan0 2>/dev/null)
+
+    # Build per-channel AP count and best signal (nmcli signal: 0–100 quality score)
+    declare -A ch_count ch_signal
+    local total=0 chan signal
+
+    while IFS=: read -r chan signal; do
+        [[ -z "$chan" || ! "$chan" =~ ^[0-9]+$ ]] && continue
+        chan=$(( 10#$chan ))
+        signal=${signal:-0}
+        if [[ "$band_ghz" == "2.4" ]]; then
+            (( chan < 1 || chan > 14 )) && continue
+        else
+            (( chan < 32 || chan > 177 )) && continue
         fi
-    done < <(printf '%s\n' "$scan_raw" | awk '/freq:/ { print $2 }')
+        (( ch_count[$chan]++ )) || true
+        (( total++ )) || true
+        if [[ -z "${ch_signal[$chan]:-}" ]] || (( signal > ch_signal[$chan] )); then
+            ch_signal[$chan]=$signal
+        fi
+    done <<< "$scan_data"
 
-    local max_count=1
+    # Adapt bar width to terminal; ~42 chars reserved for label, count, and note
+    local term_cols; term_cols=$(tput cols 2>/dev/null || echo 80)
+    local bar_width=$(( term_cols - 42 ))
+    (( bar_width < 10 )) && bar_width=10
+    (( bar_width > 40 )) && bar_width=40
+
+    local max_count=1 ch
     for ch in "${!ch_count[@]}"; do
         (( ch_count[$ch] > max_count )) && max_count=${ch_count[$ch]}
     done
 
-    # Build table and pick recommended channel
-    local table="" recommended="" min_seen=99999
-    local n filled bar i note
+    local recommended="" min_seen=99999 table="" n sig
 
     if [[ "$band_ghz" == "2.4" ]]; then
         local preferred=(1 6 11)
-        local all_chs=(1 2 3 4 5 6 7 8 9 10 11)
+        local channels=(1 2 3 4 5 6 7 8 9 10 11)
 
-        # Least busy among non-overlapping channels
         for ch in "${preferred[@]}"; do
             n=${ch_count[$ch]:-0}
             (( n < min_seen )) && { min_seen=$n; recommended=$ch; }
         done
 
-        for ch in "${all_chs[@]}"; do
-            n=${ch_count[$ch]:-0}
-            filled=$(( max_count > 0 ? n * 10 / max_count : 0 ))
-            bar=""; for (( i=0; i<10; i++ )); do
-                (( i < filled )) && bar+="▓" || bar+="░"
-            done
-            local pref=" "
-            for p in "${preferred[@]}"; do [[ "$p" == "$ch" ]] && pref="*"; done
-            note=""; [[ "$ch" == "$recommended" ]] && note="  ← recommended"
-            table+=$(printf ' Ch %2d%s  %s  %2d AP%s%s\n' \
-                "$ch" "$pref" "$bar" "$n" \
-                "$([[ $n -ne 1 ]] && printf 's')" "$note")
+        for ch in "${channels[@]}"; do
+            n=${ch_count[$ch]:-0}; sig=${ch_signal[$ch]:-0}
+            local mark="  "
+            for p in "${preferred[@]}"; do [[ "$p" == "$ch" ]] && mark="* "; done
+            table+=$(_channel_bar_row \
+                "$(printf ' Ch %2d' "$ch")" "$mark" \
+                "$n" "$sig" "$bar_width" "$max_count" "$recommended" "$ch")
+            table+=$'\n'
         done
-        table+=$'\n * = non-overlapping channels — prefer 1, 6, or 11 to minimise interference'
+        table+=$'\n * = non-overlapping channels (1, 6, 11) — minimise co-channel interference'
 
-    else  # 5 GHz
-        local non_dfs=(36 40 44 48 149 153 157 161 165)
+    else
+        local non_dfs_1=(36 40 44 48)
+        local non_dfs_3=(149 153 157 161 165)
         local dfs=(52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 144)
 
-        for ch in "${non_dfs[@]}"; do
+        for ch in "${non_dfs_1[@]}" "${non_dfs_3[@]}"; do
             n=${ch_count[$ch]:-0}
             (( n < min_seen )) && { min_seen=$n; recommended=$ch; }
         done
 
-        for ch in "${non_dfs[@]}" "${dfs[@]}"; do
-            n=${ch_count[$ch]:-0}
-            filled=$(( max_count > 0 ? n * 10 / max_count : 0 ))
-            bar=""; for (( i=0; i<10; i++ )); do
-                (( i < filled )) && bar+="▓" || bar+="░"
-            done
-            local dfs_mark="    "
-            for d in "${dfs[@]}"; do [[ "$d" == "$ch" ]] && dfs_mark=" DFS"; done
-            note=""; [[ "$ch" == "$recommended" ]] && note="  ← recommended"
-            table+=$(printf ' Ch %3d%s  %s  %2d AP%s%s\n' \
-                "$ch" "$dfs_mark" "$bar" "$n" \
-                "$([[ $n -ne 1 ]] && printf 's')" "$note")
+        table+="  -- UNII-1 (ch 36-48, non-DFS) --"$'\n'
+        for ch in "${non_dfs_1[@]}"; do
+            n=${ch_count[$ch]:-0}; sig=${ch_signal[$ch]:-0}
+            table+=$(_channel_bar_row \
+                "$(printf ' Ch %3d' "$ch")" "" \
+                "$n" "$sig" "$bar_width" "$max_count" "$recommended" "$ch")
+            table+=$'\n'
         done
-        table+=$'\n DFS = radar-detection channels — many Pi drivers restrict AP use on these'
+
+        table+=$'\n  -- UNII-3 (ch 149-165, non-DFS) --'$'\n'
+        for ch in "${non_dfs_3[@]}"; do
+            n=${ch_count[$ch]:-0}; sig=${ch_signal[$ch]:-0}
+            table+=$(_channel_bar_row \
+                "$(printf ' Ch %3d' "$ch")" "" \
+                "$n" "$sig" "$bar_width" "$max_count" "$recommended" "$ch")
+            table+=$'\n'
+        done
+
+        table+=$'\n  -- DFS channels (radar detection required) --'$'\n'
+        for ch in "${dfs[@]}"; do
+            n=${ch_count[$ch]:-0}; sig=${ch_signal[$ch]:-0}
+            table+=$(_channel_bar_row \
+                "$(printf ' Ch %3d' "$ch")" " DFS" \
+                "$n" "$sig" "$bar_width" "$max_count" "$recommended" "$ch")
+            table+=$'\n'
+        done
+        table+=$'\n DFS = radar detection required — many Pi drivers restrict AP mode on these'
     fi
 
-    # Render table to stderr (visible in terminal, not captured by caller)
     gum style \
         --border rounded \
         --border-foreground 4 \
         --padding "1 2" \
         "$(gum style --bold "  ${band_ghz} GHz channel survey — ${total} network(s) found  ")
 
-$table" >&2
-    printf '\n' >&2
+$table"
+    printf '\n'
 
-    # Return recommended channel on stdout
-    printf '%s' "$recommended"
+    SCAN_RECOMMENDED_CHANNEL="$recommended"
 }
 
 # ============================================================================
@@ -293,8 +333,9 @@ if _is_selected "$_OPT_HOTSPOT"; then
             ;;
         Scan*)
             printf '\n'
-            if ip link show wlan0 >/dev/null 2>&1 && command -v iw >/dev/null 2>&1; then
-                _recommended=$(_wifi_scan_channels "$_band_ghz")
+            if ip link show wlan0 >/dev/null 2>&1; then
+                _wifi_scan_channels "$_band_ghz"
+                _recommended="$SCAN_RECOMMENDED_CHANNEL"
                 if [[ -n "$_recommended" ]]; then
                     if gum confirm --default=true "Use recommended channel $_recommended?"; then
                         HOTSPOT_CHANNEL=$_recommended
@@ -309,7 +350,7 @@ if _is_selected "$_OPT_HOTSPOT"; then
                     HOTSPOT_CHANNEL=0
                 fi
             else
-                warn "wlan0 not available or 'iw' not installed — falling back to Auto"
+                warn "wlan0 not available — falling back to Auto"
                 HOTSPOT_CHANNEL=0
             fi
             ;;
