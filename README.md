@@ -5,8 +5,6 @@ Scripts are meant to be run with a Pi 5/CM5 (untested) unless otherwise expressl
 
 ## Usage Instructions
 
-***Please note that the script is still under construction and is not ready for deployment!***
-
 Image your Pi 5 boot media with the official Pi imager utility: https://github.com/raspberrypi/rpi-imager
 
 Select the Pi 5 and Raspbian 64-bit options. The media will be your USB-adapted M.2 drive (or other boot media).
@@ -25,14 +23,32 @@ Boot your Pi, then SSH in:
 ssh yourUsername@yourPi'sIP
 ```
 
-In your home directory, run:
+Clone the repo and run the greenfield setup script:
 
 ```
-sudo git clone https://github.com/cameronzucker/aredn-pi-setup.git
+git clone https://github.com/cameronzucker/aredn-pi-setup.git
 cd aredn-pi-setup
-sudo chmod +x setup-script.bash
-sudo ./setup-script.bash
+chmod +x pi5-greenfield-setup.sh
+sudo ./pi5-greenfield-setup.sh
 ```
+
+The script will prompt for a WiFi hotspot SSID, channel, and passphrase up front, then run the rest unattended. It targets **Raspberry Pi 5** running **Raspberry Pi OS Trixie (64-bit Desktop)**. Re-running is safe â€” most steps are idempotent.
+
+### What the script sets up
+
+| Step | What happens |
+|------|-------------|
+| System | Enables VNC, I2C, and UART; disables fake-hwclock (Pi 5 has a native RTC) |
+| Boot config | Sets `usb_max_current_enable=1` and PCIe Gen 3 (`dtparam=pciex1_gen=3`) |
+| Firewall | UFW with deny-inbound defaults; allows SSH, HTTP/S, VNC, hotspot subnet, Tailscale |
+| GPS / NTP | Installs `gpsd`, `gpsd-clients`, `pps-tools`, and `chrony` (manual GPS config required) |
+| Tools | `tmux`, `git`, `gh`, `jq`, `ripgrep`, `fd`, `btop`, `nvme-cli`, and more |
+| CAD | KiCad, FreeCAD, OpenSCAD, Inkscape (~1 GB, takes a while) |
+| VS Code | Installed from Microsoft's apt repo with Claude Code and Codex extensions |
+| AI CLIs | `claude` and `codex` via npm |
+| Tailscale | Installed; prompts to run `tailscale up` at the end |
+| Hotspot | Creates a WPA2 WiFi AP on `wlan0` sharing the `eth0` uplink via NetworkManager |
+| Dark mode | GTK 3/4 dark theme preference written to user config |
 ## Hardware
 
 This project is based on the Pi 5 for a few important reasons:
@@ -58,26 +74,26 @@ There are a few PoE hats which will work depending on the desired overall footpr
 
 * Waveshare POE M.2 HAT+: https://www.waveshare.com/product/raspberry-pi/hats/poe-m.2-hat-plus.htm<br>
 * 52Pi M.2 NVME M-KEY PoE+ Hat: https://52pi.com/products/m-2-nvme-m-key-poe-hat-with-official-pi-5-active-cooler-for-raspberry-pi-5-support-m-2-nvme-ssd-2230-2242<br>
-* **52Pi P33 M.2 NVMe 2280 PoE+ HAT†:** https://52pi.com/products/p33-m-2-nvme-2280-poe-hat-extension-board-for-raspberry-pi-5
+* **52Pi P33 M.2 NVMe 2280 PoE+ HATï¿½:** https://52pi.com/products/p33-m-2-nvme-2280-poe-hat-extension-board-for-raspberry-pi-5
 
-†This hat also provides 3.3/5/12V out on six pins (one hot for each voltage with adjacent ground), which is potentially useful for powering other small devices.
+ï¿½This hat also provides 3.3/5/12V out on six pins (one hot for each voltage with adjacent ground), which is potentially useful for powering other small devices.
 
 ### Storage
 This project makes use of M.2 drives for their quantum leap in speed and reliability over Micro SD cards. Since these Pis will be used as web application servers, including a file serve function which incurs frequent writes, this is an important factor and worth the relatively minor price increase. 2230/2242 drives are more expensive than larger 2280 drives and have worse sustained performance due to lacking DRAM cache, but they'll fit in smaller cases. The obstacle precluding use of truly robust enterprise SATA SSDs like the Intel P4610 is lack of boot support.
 
-* For 2230/2242 - Samsung PM991a†: https://www.amazon.com/dp/B0BDWCC47L<br>
+* For 2230/2242 - Samsung PM991aï¿½: https://www.amazon.com/dp/B0BDWCC47L<br>
 * 2230/2242 alternate - Official Raspberry Pi NVMe SSD: https://www.pishop.us/product/raspberry-pi-nvme-ssd-512gb/<br>
 * **For 2280 - Crucial P3 Plus 500GB:** https://www.amazon.com/dp/B0B25NTRGD
 
-†The PM991a is a high quality SSD which probably outperforms the official Pi 2230 SSD, but since the Pi 5 only offers PCIe 3.0 x1, the real world beneift of the better part may be negligible.
+ï¿½The PM991a is a high quality SSD which probably outperforms the official Pi 2230 SSD, but since the Pi 5 only offers PCIe 3.0 x1, the real world beneift of the better part may be negligible.
 
 ### RTC Battery Backup
 If the Pi is shutdown or loses power, especially for extended periods, keeping the RTC running and accurate is valuable for expediting redeployment without relying on a GPS fix. While the Pi 5 has a built-in RTC chip, it needs an external battery connected to a dedicated header to supply power.
 
 * Panasonic ML-2020 lithium manganese dioxide rechargeable battery: https://www.pishop.us/product/rtc-battery-for-raspberry-pi-5/<br>
-* **RTCBattery Box Real Time Clock Holder for Pi 5†:** https://www.amazon.com/dp/B0CRKQ2MG1
+* **RTCBattery Box Real Time Clock Holder for Pi 5ï¿½:** https://www.amazon.com/dp/B0CRKQ2MG1
 
-†This option requires you to furnish a common CR2032 battery. This may be preferable due to their abundance if something should happen to the RTC battery. They are also higher capacity than rechargeable options, allowing for extended shutdown standby time (potentially years).
+ï¿½This option requires you to furnish a common CR2032 battery. This may be preferable due to their abundance if something should happen to the RTC battery. They are also higher capacity than rechargeable options, allowing for extended shutdown standby time (potentially years).
 
 ### Coolers
 These Pis are intended for remote deployment in hot Southwest desert conditions and require active cooling. The following are known to work well:
@@ -105,11 +121,11 @@ But, any similar device will work.
 ## WIP - Onboard GPS
 Including GPS directly on the board frees up a USB port and provides access to much more precise PPS timing. I haven't had a chance to test this on top of the M.2/PoE boards, so it's not included in the script yet.
 
-* Waveshare LC29H Series Dual-band GPS Module for Raspberry Pi†: https://www.waveshare.com/lc29h-gps-hat.htm?sku=25278
+* Waveshare LC29H Series Dual-band GPS Module for Raspberry Piï¿½: https://www.waveshare.com/lc29h-gps-hat.htm?sku=25278
 
-†Requires an ML1220 rechargeable cell which is not included.
+ï¿½Requires an ML1220 rechargeable cell which is not included.
 
 ## Future Hardware
 The ideal Pi hat would combine a UPS, PCIe 3.0 NVMe adapter, full 40 pin GPIO passthrough, and 24V *passive* PoE support (most AREDN hardware runs on 24V PoE). I recently found such a part from Pi Modules Technologies in Greece, and will create a branch for it if the hardware does what it says on the tin.
 
-* M.2 – UPS and Power Management HAT Advanced/PPoE: https://pimodules.com/product/m-2-ups-and-power-management-hat-advanced-ppoe
+* M.2 ï¿½ UPS and Power Management HAT Advanced/PPoE: https://pimodules.com/product/m-2-ups-and-power-management-hat-advanced-ppoe
